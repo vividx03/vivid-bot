@@ -23,7 +23,7 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 DOWNLOAD_DIR = "./downloads"
 DB_FILE = "vivid_db.json"
 SCHEDULE_FILE = "schedules.json"
-TIMEZONE_OFFSET = int(os.environ.get("TZ_OFFSET", "5"))  # IST = +5
+TIMEZONE_OFFSET = int(os.environ.get("TZ_OFFSET", "5.5"))  # IST = +5.5
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise SystemExit("❌ API_ID / API_HASH / BOT_TOKEN env vars missing!")

@@ -1,5 +1,5 @@
-pyrogram==2.0.106
+pyrogram
 tgcrypto
-yt-dlp
-pillow
 aiohttp
+yt-dlp
+Pillow

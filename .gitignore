@@ -1,8 +1,0 @@
-downloads/
-*.session
-*.session-journal
-__pycache__/
-*.pyc
-.env
-vivid_db.json
-schedules.json

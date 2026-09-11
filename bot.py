@@ -10,7 +10,7 @@ import subprocess
 from datetime import datetime, timezone, timedelta
 from aiohttp import web
 from yt_dlp import YoutubeDL
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from PIL import Image, ImageDraw, ImageFont
 
@@ -601,19 +601,15 @@ async def health_server():
     print(f"✅ Health server online on port {port}", flush=True)
 
 # ============================================================
-# MAIN ENTRYPOINT (With Pyrogram Idle)
+# MAIN ENTRYPOINT
 # ============================================================
-async def main():
+async def start_services():
     print("⏳ Starting health server...", flush=True)
     await health_server()
-    print("⏳ Starting Telegram client...", flush=True)
-    await app.start()
-    me = await app.get_me()
-    print(f"🚀 Bot is running 24/7 as @{me.username}", flush=True)
+    print("⏰ Starting background scheduler worker...", flush=True)
     asyncio.create_task(scheduler_worker(app))
-    print("⏰ Scheduler started successfully!", flush=True)
-    await idle()
-    await app.stop()
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    app.loop.create_task(start_services())
+    print("🚀 Starting Pyrogram Client with app.run()...", flush=True)
+    app.run()

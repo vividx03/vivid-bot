@@ -10,20 +10,20 @@ import subprocess
 from datetime import datetime, timezone, timedelta
 from aiohttp import web
 from yt_dlp import YoutubeDL
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from PIL import Image, ImageDraw, ImageFont
 
 # ============================================================
-# CONFIGURATION — PURELY VIA ENVIRONMENT VARIABLES
-# Public repo ke liye sensitive keys yahan hardcode nahi hain
+# CONFIGURATION — VIA ENVIRONMENT VARIABLES
 # ============================================================
 API_ID_RAW = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 if not API_ID_RAW or not API_HASH or not BOT_TOKEN:
-    raise SystemExit("❌ ERROR: API_ID, API_HASH, ya BOT_TOKEN environment variables missing hain! Hosting dashboard me set karein.")
+    print("❌ ERROR: API_ID, API_HASH, ya BOT_TOKEN missing hain!", flush=True)
+    raise SystemExit("Environment variables missing!")
 
 API_ID = int(API_ID_RAW)
 
@@ -251,7 +251,7 @@ async def download_thumbnail(url):
                             if os.path.getsize(final_path) > 0:
                                 return final_path
         except Exception as e:
-            print(f"Thumbnail error: {e}")
+            print(f"Thumbnail error: {e}", flush=True)
             if os.path.exists(temp_path):
                 os.remove(temp_path)
     return await create_fallback_thumbnail()
@@ -385,7 +385,7 @@ async def scheduler_worker(client: Client):
                     job["done"] = True
                     save_schedules(schedules)
                     triggered_any = True
-                    print(f"⏰ [Scheduler] Triggering scheduled download for: {job['title']}")
+                    print(f"⏰ [Scheduler] Triggering scheduled download for: {job['title']}", flush=True)
 
                     try:
                         start_msg = await client.send_message(
@@ -404,12 +404,12 @@ async def scheduler_worker(client: Client):
                             )
                         )
                     except Exception as err:
-                        print(f"Scheduler execution error: {err}")
+                        print(f"Scheduler execution error: {err}", flush=True)
 
             if triggered_any:
                 save_schedules(schedules)
         except Exception as e:
-            print(f"Scheduler loop error: {e}")
+            print(f"Scheduler loop error: {e}", flush=True)
 
         await asyncio.sleep(30)
 
@@ -586,7 +586,7 @@ async def download_callback(client: Client, callback_query: CallbackQuery):
     )
 
 # ============================================================
-# DUMMY HEALTH SERVER (Render/Railway Sleep Preventer)
+# DUMMY HEALTH SERVER
 # ============================================================
 async def health_server():
     async def handle(request):
@@ -598,18 +598,22 @@ async def health_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"✅ Health check server listening on port {port}")
+    print(f"✅ Health server online on port {port}", flush=True)
 
 # ============================================================
-# MAIN ENTRYPOINT
+# MAIN ENTRYPOINT (With Pyrogram Idle)
 # ============================================================
 async def main():
-    asyncio.create_task(health_server())
+    print("⏳ Starting health server...", flush=True)
+    await health_server()
+    print("⏳ Starting Telegram client...", flush=True)
     await app.start()
     me = await app.get_me()
-    print(f"🚀 Bot is running 24/7 as @{me.username}")
+    print(f"🚀 Bot is running 24/7 as @{me.username}", flush=True)
     asyncio.create_task(scheduler_worker(app))
-    await asyncio.Event().wait()
+    print("⏰ Scheduler started successfully!", flush=True)
+    await idle()
+    await app.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.get_event_loop().run_until_complete(main())

@@ -7,10 +7,11 @@ import re
 import json
 import math
 import subprocess
+import threading
 from datetime import datetime, timezone, timedelta
 from aiohttp import web
 from yt_dlp import YoutubeDL
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from PIL import Image, ImageDraw, ImageFont
 
@@ -43,7 +44,14 @@ for f in [DB_FILE, SCHEDULE_FILE]:
         with open(f, "w") as fp:
             json.dump({}, fp)
 
-app = Client("vivid_pro_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# in_memory=True se session lock ka issue 100% khatam
+app = Client(
+    "vivid_pro_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True
+)
 
 # ============================================================
 # GLOBAL DATA
@@ -154,7 +162,7 @@ async def split_video(file_path, total_duration, msg=None):
     return split_files
 
 # ============================================================
-# PROGRESS HOOKS (12-second updates)
+# PROGRESS HOOKS
 # ============================================================
 def progress_hook(d):
     msg_id = d.get('params', {}).get('msg_id')
@@ -416,8 +424,9 @@ async def scheduler_worker(client: Client):
 # ============================================================
 # COMMANDS & HANDLERS
 # ============================================================
-@app.on_message(filters.command("start"))
+@app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
+    print(f"📩 /start command received from user {message.from_user.id}!", flush=True)
     text = """```
 ╔══════════════════════════════════╗
         VIVID DOWNLOADER ENGINE
@@ -436,7 +445,7 @@ System Ready For Commands...
 ```"""
     await message.reply_text(text)
 
-@app.on_message(filters.command("mylive"))
+@app.on_message(filters.command("mylive") & filters.private)
 async def mylive_cmd(client, message):
     schedules = load_schedules()
     active = [v for v in schedules.values() if v.get("chat_id") == message.chat.id and not v.get("done")]
@@ -450,7 +459,7 @@ async def mylive_cmd(client, message):
         res += f"🎬 **{item['title']}**\n⏰ Start Time: `{start_dt.strftime('%d %b %Y, %I:%M %p IST')}`\n🔗 `{item['url']}`\n\n"
     await message.reply_text(res)
 
-@app.on_message(filters.command("uploaddd"))
+@app.on_message(filters.command("uploaddd") & filters.private)
 async def bulk_upload(client, message):
     files = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith((".mkv", ".mp4"))]
     if not files:
@@ -483,7 +492,7 @@ async def bulk_upload(client, message):
                 os.remove(thumb_path)
 
 # --- LINK HANDLER ---
-@app.on_message(filters.regex(r"https?://(www\.)?youtube\.com|youtu\.be"))
+@app.on_message(filters.regex(r"https?://(www\.)?youtube\.com|youtu\.be") & filters.private)
 async def link_handler(client, message):
     url = message.text.strip()
     try: await message.delete()
@@ -586,30 +595,43 @@ async def download_callback(client: Client, callback_query: CallbackQuery):
     )
 
 # ============================================================
-# DUMMY HEALTH SERVER
+# DUMMY HEALTH SERVER (Background Thread Me Isolated)
 # ============================================================
-async def health_server():
+def run_health_server():
     async def handle(request):
         return web.Response(text="Vivid Bot is Online 24/7 🚀")
-    server = web.Application()
-    server.router.add_get('/', handle)
-    runner = web.AppRunner(server)
-    await runner.setup()
+    
+    server_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(server_loop)
+    server_app = web.Application()
+    server_app.router.add_get('/', handle)
+    runner = web.AppRunner(server_app)
+    server_loop.run_until_complete(runner.setup())
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"✅ Health server online on port {port}", flush=True)
+    server_loop.run_until_complete(site.start())
+    print(f"✅ Isolated Health server online on port {port}", flush=True)
+    server_loop.run_forever()
 
 # ============================================================
 # MAIN ENTRYPOINT
 # ============================================================
-async def start_services():
-    print("⏳ Starting health server...", flush=True)
-    await health_server()
-    print("⏰ Starting background scheduler worker...", flush=True)
+async def main():
+    # Health server ko alag thread me start karo taaki Telegram loop 100% free rahe
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
+    print("⏳ Starting Telegram client...", flush=True)
+    await app.start()
+    me = await app.get_me()
+    print(f"🚀 Bot is running 24/7 as @{me.username}", flush=True)
+
     asyncio.create_task(scheduler_worker(app))
+    print("⏰ Background scheduler started!", flush=True)
+
+    # Pyrogram idle signal
+    await idle()
+    await app.stop()
 
 if __name__ == "__main__":
-    app.loop.create_task(start_services())
-    print("🚀 Starting Pyrogram Client with app.run()...", flush=True)
-    app.run()
+    asyncio.run(main())

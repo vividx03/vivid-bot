@@ -6,23 +6,27 @@ import uuid
 import re
 import json
 from datetime import datetime, timedelta
+from aiohttp import web
 from yt_dlp import YoutubeDL
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from PIL import Image, ImageDraw, ImageFont
 
 # ============================================================
-# CONFIG — SAB SECRETS SE (Public repo mein kuch nahi dikhega)
+# CONFIG — SAB ENV VARIABLES SE (Public repo mein kuch nahi)
 # ============================================================
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))  # optional, tumhara telegram ID
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 DOWNLOAD_DIR = "./downloads"
 DB_FILE = "vivid_db.json"
 SCHEDULE_FILE = "schedules.json"
-TIMEZONE_OFFSET = int(os.environ.get("TZ_OFFSET", "5"))  # IST = +5 (hours)
+TIMEZONE_OFFSET = int(os.environ.get("TZ_OFFSET", "5"))  # IST = +5
+
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    raise SystemExit("❌ API_ID / API_HASH / BOT_TOKEN env vars missing!")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 for f in [DB_FILE, SCHEDULE_FILE]:
@@ -38,7 +42,6 @@ app = Client("vivid_pro_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TO
 download_data = {}
 last_update_time = {}
 url_vault = {}
-scheduled_jobs = {}   # {job_id: {chat_id, url, quality, run_at, title}}
 
 # ============================================================
 # UTILS
@@ -85,7 +88,7 @@ def humanbytes(size):
         size /= 1024.0
 
 def now_local():
-    """Return current time in configured timezone (as naive datetime)"""
+    """Current time in configured timezone (naive datetime)"""
     return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
 
 # ============================================================
@@ -196,10 +199,9 @@ async def create_fallback_thumbnail():
     return file_path
 
 # ============================================================
-# CORE DOWNLOAD & UPLOAD (reusable — schedule bhi use karega)
+# CORE DOWNLOAD & UPLOAD (reusable)
 # ============================================================
 async def process_download(client, chat_id, url, quality, title_hint=None, reply_msg_id=None):
-    """Download + upload karo. Reply msg update karta hai ya new bhejta hai."""
     ydl_probe = {'quiet': True, 'no_warnings': True}
     loop = asyncio.get_event_loop()
     info = await loop.run_in_executor(None, lambda: YoutubeDL(ydl_probe).extract_info(url, download=False))
@@ -294,7 +296,7 @@ async def process_download(client, chat_id, url, quality, title_hint=None, reply
 # SCHEDULER — Background loop
 # ============================================================
 async def scheduler_loop(client: Client):
-    """Har 30 sec check karo, time aaya toh download chalao."""
+    """Har 30 sec check karo, time aaya toh auto-download chalao."""
     while True:
         try:
             schedules = load_schedules()
@@ -304,6 +306,7 @@ async def scheduler_loop(client: Client):
                 run_at = datetime.fromisoformat(job['run_at'])
                 if now >= run_at and not job.get('done'):
                     due_ids.append((job_id, job))
+
             for job_id, job in due_ids:
                 print(f"⏰ Running scheduled job: {job_id}")
                 schedules[job_id]['done'] = True
@@ -314,10 +317,7 @@ async def scheduler_loop(client: Client):
                         f"⏰ **Scheduled Live Started!**\n\n🎬 {job['title']}\n📥 Quality: {job['quality']}"
                     )
                     await process_download(
-                        client,
-                        job['chat_id'],
-                        job['url'],
-                        job['quality'],
+                        client, job['chat_id'], job['url'], job['quality'],
                         title_hint=job['title']
                     )
                 except Exception as e:
@@ -325,7 +325,8 @@ async def scheduler_loop(client: Client):
                     try:
                         await client.send_message(job['chat_id'], f"❌ Scheduled job failed: {e}")
                     except: pass
-            # Cleanup done jobs (older than 1 day)
+
+            # Cleanup done jobs older than 1 day
             schedules = load_schedules()
             to_del = [k for k, v in schedules.items()
                       if v.get('done') and (now - datetime.fromisoformat(v['run_at'])).total_seconds() > 86400]
@@ -355,14 +356,15 @@ Status : ONLINE ✅
 
 Commands:
 /live <link> YYYY-MM-DD HH:MM  → schedule
-/mylive → list scheduled
-/cancel_live <id> → cancel
+/live <link> HH:MM             → aaj/kal ka time
+/mylive                        → list scheduled
+/cancel_live <id>              → cancel
+/uploaddd                      → re-upload old files
 
 Developed By : VIVID
 ```"""
     await message.reply_text(text)
 
-# --- YouTube link → quality buttons ---
 @app.on_message(filters.regex(r"https?://(www\.)?youtube\.com|youtu\.be"))
 async def link_handler(client, message):
     url = message.text.strip()
@@ -400,31 +402,27 @@ async def link_handler(client, message):
     except Exception as e:
         await tmp.edit_text(f"❌ ERROR: {str(e)}")
 
-# --- /live command ---
 @app.on_message(filters.command("live"))
 async def schedule_live(client, message):
-    """
-    Usage:
-      /live <youtube_live_url> YYYY-MM-DD HH:MM
-      ya
-      /live <url> 9:00          (aaj/kal ka 9 baje)
+    """Usage:
+       /live <url> YYYY-MM-DD HH:MM
+       /live <url> HH:MM   (aaj ya kal)
     """
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.reply_text(
             "📝 **Usage:**\n\n"
             "`/live <youtube_link> YYYY-MM-DD HH:MM`\n"
-            "Example:\n"
-            "`/live https://youtu.be/xxxx 2026-03-15 09:00`\n\n"
-            "**Shortcut** (aaj/kal ka time):\n"
-            "`/live <link> 9:00` → aaj 9 baje (agar guzar gaya toh kal)\n"
+            "Example: `/live https://youtu.be/xxxx 2026-03-15 09:00`\n\n"
+            "**Shortcut (aaj/kal):**\n"
+            "`/live <link> 9:00` → aaj 9 baje (guzar gaya toh kal)\n"
             "`/live <link> 21:30` → aaj 9:30 PM\n"
         )
         return
 
     parts = args[1].strip().split()
     if len(parts) < 2:
-        await message.reply_text("❌ Link ya time missing hai. `/live` likho for help.")
+        await message.reply_text("❌ Link ya time missing. `/live` for help.")
         return
 
     url = parts[0]
@@ -432,14 +430,11 @@ async def schedule_live(client, message):
         await message.reply_text("❌ Invalid URL.")
         return
 
-    # Time parse
     time_str = " ".join(parts[1:])
     run_at = None
     try:
         if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}$", time_str):
-            # Full format
-            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
-            run_at = dt
+            run_at = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
         elif re.match(r"^\d{1,2}:\d{2}$", time_str):
             h, m = map(int, time_str.split(":"))
             now = now_local()
@@ -453,13 +448,12 @@ async def schedule_live(client, message):
         await message.reply_text("❌ Time format galat. `YYYY-MM-DD HH:MM` ya `HH:MM` use karo.")
         return
 
-    # Fetch video info for title
     try:
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, lambda: YoutubeDL({'quiet': True}).extract_info(url, download=False))
         title = info.get('title', 'Live Stream')
     except Exception as e:
-        await message.reply_text(f"⚠️ Info fetch failed: {e}\nTitle 'Live Stream' se save kar raha hoon.")
+        await message.reply_text(f"⚠️ Info fetch failed: {e}\nSaving as 'Live Stream'")
         title = "Live Stream"
 
     job_id = str(uuid.uuid4())[:8]
@@ -553,9 +547,25 @@ async def bulk_upload(client, message):
                 os.remove(thumb_path)
 
 # ============================================================
-# MAIN — scheduler + bot ek saath
+# HEALTH SERVER (Render ke liye — sleep rok)
+# ============================================================
+async def health_server():
+    async def handle(request):
+        return web.Response(text="Vivid Bot is alive ✅")
+    http_app = web.Application()
+    http_app.router.add_get('/', handle)
+    runner = web.AppRunner(http_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"✅ Health server on :{port}")
+
+# ============================================================
+# MAIN — Bot + Scheduler + Health ek saath
 # ============================================================
 async def main():
+    asyncio.create_task(health_server())
     await app.start()
     me = await app.get_me()
     print(f"🚀 Vivid Bot online: @{me.username}")

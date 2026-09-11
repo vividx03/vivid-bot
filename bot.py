@@ -5,7 +5,9 @@ import time
 import uuid
 import re
 import json
-from datetime import datetime, timedelta
+import math
+import subprocess
+from datetime import datetime, timezone, timedelta
 from aiohttp import web
 from yt_dlp import YoutubeDL
 from pyrogram import Client, filters
@@ -13,20 +15,27 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, 
 from PIL import Image, ImageDraw, ImageFont
 
 # ============================================================
-# CONFIG — SAB ENV VARIABLES SE (Public repo mein kuch nahi)
+# CONFIGURATION — PURELY VIA ENVIRONMENT VARIABLES
+# Public repo ke liye sensitive keys yahan hardcode nahi hain
 # ============================================================
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+API_ID_RAW = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+if not API_ID_RAW or not API_HASH or not BOT_TOKEN:
+    raise SystemExit("❌ ERROR: API_ID, API_HASH, ya BOT_TOKEN environment variables missing hain! Hosting dashboard me set karein.")
+
+API_ID = int(API_ID_RAW)
 
 DOWNLOAD_DIR = "./downloads"
 DB_FILE = "vivid_db.json"
 SCHEDULE_FILE = "schedules.json"
-TIMEZONE_OFFSET = int(os.environ.get("TZ_OFFSET", "5.5"))  # IST = +5.5
 
-if not API_ID or not API_HASH or not BOT_TOKEN:
-    raise SystemExit("❌ API_ID / API_HASH / BOT_TOKEN env vars missing!")
+# Telegram max limit: 2GB (Safe boundary: 1.95 GB)
+MAX_FILE_SIZE = 1950 * 1024 * 1024  
+
+# Indian Standard Time (+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 for f in [DB_FILE, SCHEDULE_FILE]:
@@ -44,16 +53,8 @@ last_update_time = {}
 url_vault = {}
 
 # ============================================================
-# UTILS
+# UTILITY FUNCTIONS
 # ============================================================
-def load_schedules():
-    with open(SCHEDULE_FILE, "r") as f:
-        return json.load(f)
-
-def save_schedules(data):
-    with open(SCHEDULE_FILE, "w") as f:
-        json.dump(data, f)
-
 def save_to_db(file_name, thumb_url, duration):
     with open(DB_FILE, "r") as f:
         db = json.load(f)
@@ -65,6 +66,17 @@ def get_from_db(file_name):
     with open(DB_FILE, "r") as f:
         db = json.load(f)
     return db.get(file_name, {})
+
+def load_schedules():
+    try:
+        with open(SCHEDULE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_schedules(data):
+    with open(SCHEDULE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 def get_progress_bar(percent):
     done = int(percent / 5)
@@ -78,7 +90,8 @@ def TimeFormatter(seconds: int) -> str:
         return f"{hours}h {minutes}m {seconds}s"
     elif minutes > 0:
         return f"{minutes}m {seconds}s"
-    return f"{seconds}s"
+    else:
+        return f"{seconds}s"
 
 def humanbytes(size):
     if not size: return "0 B"
@@ -87,20 +100,71 @@ def humanbytes(size):
             return f"{size:.2f} {unit}"
         size /= 1024.0
 
-def now_local():
-    """Current time in configured timezone (naive datetime)"""
-    return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
+def get_video_duration(file_path):
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries",
+            "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return float(result.stdout.strip())
+    except Exception:
+        return 0
 
 # ============================================================
-# PROGRESS HOOKS
+# 2GB+ VIDEO SPLITTER (Lossless split via FFmpeg)
+# ============================================================
+async def split_video(file_path, total_duration, msg=None):
+    file_size = os.path.getsize(file_path)
+    if file_size <= MAX_FILE_SIZE:
+        return [file_path]
+
+    num_parts = math.ceil(file_size / MAX_FILE_SIZE)
+    if total_duration <= 0:
+        total_duration = get_video_duration(file_path)
+    if total_duration <= 0:
+        total_duration = 3600
+
+    part_duration = total_duration / num_parts
+    base, ext = os.path.splitext(file_path)
+    split_files = []
+
+    if msg:
+        try: await msg.edit_text(f"✂️ File is {humanbytes(file_size)} (> 2GB).\nSplitting into {num_parts} parts lossless...")
+        except: pass
+
+    loop = asyncio.get_event_loop()
+
+    for i in range(num_parts):
+        start_time = i * part_duration
+        out_part = f"{base}.part{i+1:03d}{ext}"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_time),
+            "-i", file_path,
+            "-t", str(part_duration),
+            "-c", "copy",
+            "-map", "0",
+            out_part
+        ]
+        await loop.run_in_executor(None, lambda: subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        if os.path.exists(out_part) and os.path.getsize(out_part) > 0:
+            split_files.append(out_part)
+
+    return split_files
+
+# ============================================================
+# PROGRESS HOOKS (12-second updates)
 # ============================================================
 def progress_hook(d):
     msg_id = d.get('params', {}).get('msg_id')
     if not msg_id: return
     if d['status'] == 'downloading':
         p = d.get('_percent_str', '0%').replace('%', '').strip()
-        try: percent = float(p)
-        except: percent = 0
+        try:
+            percent = float(p)
+        except Exception:
+            percent = 0
         download_data[msg_id] = {
             "p": percent,
             "d": d.get('downloaded_bytes', 0),
@@ -121,7 +185,7 @@ async def status_manager(message: Message, msg_id: int):
             continue
         last_update_time[msg_id] = now
         bar = get_progress_bar(data['p'])
-        text = (
+        status_text = (
             "╔════════════════════╗\n"
             "  ⚡ VIVID DOWNLOADING\n"
             "╚════════════════════╝\n\n"
@@ -132,24 +196,27 @@ async def status_manager(message: Message, msg_id: int):
             f"⏳ ETA: {TimeFormatter(data['e'])}\n\n"
             "👨‍💻 DEV: VIVID"
         )
-        try: await message.edit_text(text)
-        except: pass
-        if data['p'] >= 100: break
+        try:
+            await message.edit_text(status_text)
+        except Exception:
+            pass
+        if data['p'] >= 100:
+            break
         await asyncio.sleep(10)
 
-async def upload_progress(current, total, msg, start_time):
+async def upload_progress(current, total, msg, start_time, part_tag=""):
     now = time.time()
     if msg.id in last_update_time and (now - last_update_time[msg.id]) < 12:
         return
     last_update_time[msg.id] = now
     diff = now - start_time
-    percent = round(current * 100 / total, 1)
+    percent = round(current * 100 / total, 1) if total > 0 else 0
     speed = current / diff if diff > 0 else 0
     eta = TimeFormatter((total - current) / speed) if speed > 0 else "0s"
     bar = get_progress_bar(percent)
     text = (
         "╔════════════════════╗\n"
-        "  ⚡ VIVID UPLOADING\n"
+        f"  ⚡ VIVID UPLOADING {part_tag}\n"
         "╚════════════════════╝\n\n"
         f"{bar}\n\n"
         f"📊 UPLOADING: {percent}%\n"
@@ -158,11 +225,13 @@ async def upload_progress(current, total, msg, start_time):
         f"⏳ ETA: {eta}\n\n"
         "👨‍💻 DEV: VIVID"
     )
-    try: await msg.edit_text(text)
-    except: pass
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
 
 # ============================================================
-# THUMBNAIL
+# THUMBNAIL HANDLERS
 # ============================================================
 async def download_thumbnail(url):
     if url:
@@ -179,9 +248,10 @@ async def download_thumbnail(url):
                             final_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4()}.jpg")
                             img.save(final_path, "JPEG", quality=95)
                             os.remove(temp_path)
-                            return final_path
+                            if os.path.getsize(final_path) > 0:
+                                return final_path
         except Exception as e:
-            print(f"Thumb error: {e}")
+            print(f"Thumbnail error: {e}")
             if os.path.exists(temp_path):
                 os.remove(temp_path)
     return await create_fallback_thumbnail()
@@ -192,43 +262,23 @@ async def create_fallback_thumbnail():
     draw = ImageDraw.Draw(img)
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 80)
-    except:
+    except Exception:
         font = ImageFont.load_default()
     draw.text((640, 360), "VIVID", fill="white", anchor="mm", font=font)
     img.save(file_path, "JPEG", quality=95)
     return file_path
 
 # ============================================================
-# CORE DOWNLOAD & UPLOAD (reusable)
+# CORE EXECUTION ENGINE
 # ============================================================
-async def process_download(client, chat_id, url, quality, title_hint=None, reply_msg_id=None):
-    ydl_probe = {'quiet': True, 'no_warnings': True}
-    loop = asyncio.get_event_loop()
-    info = await loop.run_in_executor(None, lambda: YoutubeDL(ydl_probe).extract_info(url, download=False))
-
-    title = info.get('title', title_hint or 'video')
-    duration = info.get('duration', 0)
-    uploader = info.get('uploader') or info.get('channel') or "Unknown"
-    thumb_url = info.get('thumbnail')
-    if not thumb_url and info.get('thumbnails'):
-        ts = sorted(info['thumbnails'], key=lambda x: x.get('width', 0) * x.get('height', 0), reverse=True)
-        if ts: thumb_url = ts[0].get('url')
-    if not thumb_url:
-        thumb_url = "https://img.youtube.com/vi/" + info.get('id', '') + "/maxresdefault.jpg"
-
-    if reply_msg_id:
-        msg = await client.edit_message_text(chat_id, reply_msg_id, "⚡ `Initializing Kernel...`")
-    else:
-        msg = await client.send_message(chat_id, "⚡ `Initializing Kernel...`")
-
-    last_update_time[msg.id] = time.time()
-
-    raw_title = title.split('|')[0].split('-')[0].strip()
+async def execute_task(client: Client, chat_id: int, url: str, quality: str, session_info: dict, target_msg: Message):
+    msg = target_msg
+    raw_title = session_info['title'].split('|')[0].split('-')[0].strip()
     clean_title = re.sub(r'[\\/*?:"<>|]', '', raw_title).strip() or "video"
     file_name = f"{clean_title} vivid.mkv"
     file_path = os.path.join(DOWNLOAD_DIR, file_name)
 
-    save_to_db(file_name, thumb_url, duration)
+    save_to_db(file_name, session_info['thumb'], session_info['duration'])
 
     if quality == "best":
         fmt = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best"
@@ -247,6 +297,7 @@ async def process_download(client, chat_id, url, quality, title_hint=None, reply
         'retries': 20,
         'fragment_retries': 20,
         'concurrent_fragments': 16,
+        'throttled_rate': 1000000,
         'no_check_certificate': True,
         'no_part': True,
         'hls_prefer_native': True,
@@ -258,88 +309,112 @@ async def process_download(client, chat_id, url, quality, title_hint=None, reply
     }
 
     thumb_path = None
+    created_parts = []
     try:
         asyncio.create_task(status_manager(msg, msg.id))
-        thumb_path = await download_thumbnail(thumb_url)
+        thumb_path = await download_thumbnail(session_info['thumb'])
+
+        loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: YoutubeDL(ydl_opts).download([url]))
 
         if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-            raise Exception("Downloaded file missing or empty.")
+            raise Exception("Downloaded file is missing or empty.")
 
-        await asyncio.sleep(2)
-        await msg.edit_text("📡 `Uploading Payload...`")
+        video_dur = int(session_info.get('duration') or get_video_duration(file_path))
+        upload_queue = await split_video(file_path, video_dur, msg)
 
-        start_time = time.time()
-        last_update_time[msg.id] = start_time
+        total_parts = len(upload_queue)
+        for idx, current_file in enumerate(upload_queue, start=1):
+            if current_file != file_path:
+                created_parts.append(current_file)
 
-        caption = f"{title}\n\n[{uploader}]\n\n[𝐂𝐑𝐄𝐃𝐈𝐓 : 𝐕𝐈𝐕𝐈𝐃 🤍](https://whatsapp.com/channel/0029VbDx2j1BadmU3wdvsv31)"
+            part_tag = f"[{idx}/{total_parts}]" if total_parts > 1 else ""
+            await msg.edit_text(f"📡 `Uploading Payload {part_tag}...`")
+            start_time = time.time()
+            last_update_time[msg.id] = start_time
 
-        await client.send_video(
-            chat_id=chat_id,
-            video=file_path,
-            caption=caption,
-            thumb=thumb_path,
-            duration=int(duration),
-            progress=upload_progress,
-            progress_args=(msg, start_time)
-        )
+            part_caption = f"{session_info['title']}"
+            if total_parts > 1:
+                part_caption += f" — Part {idx}/{total_parts}"
+            part_caption += f"\n\n[{session_info['uploader']}]\n\n[𝐂𝐑𝐄𝐃𝐈𝐓 : 𝐕𝐈𝐕𝐈𝐃 🤍](https://whatsapp.com/channel/0029VbDx2j1BadmU3wdvsv31)"
+
+            p_dur = int(video_dur / total_parts) if total_parts > 1 else video_dur
+
+            await client.send_video(
+                chat_id=chat_id,
+                video=current_file,
+                caption=part_caption,
+                thumb=thumb_path,
+                duration=p_dur,
+                progress=upload_progress,
+                progress_args=(msg, start_time, part_tag)
+            )
+            await asyncio.sleep(2)
+
         await msg.delete()
+
     except Exception as e:
-        try: await msg.edit_text(f"❌ ERROR: {str(e)}")
-        except: pass
+        error_msg = f"❌ ERROR: {str(e)}"
+        try: await msg.edit_text(error_msg)
+        except Exception: pass
     finally:
         if thumb_path and os.path.exists(thumb_path):
-            os.remove(thumb_path)
+            try: os.remove(thumb_path)
+            except: pass
+        if os.path.exists(file_path):
+            try: os.remove(file_path)
+            except: pass
+        for p in created_parts:
+            if os.path.exists(p):
+                try: os.remove(p)
+                except: pass
         download_data.pop(msg.id, None)
 
 # ============================================================
-# SCHEDULER — Background loop
+# BACKGROUND SCHEDULER
 # ============================================================
-async def scheduler_loop(client: Client):
-    """Har 30 sec check karo, time aaya toh auto-download chalao."""
+async def scheduler_worker(client: Client):
     while True:
         try:
             schedules = load_schedules()
-            now = now_local()
-            due_ids = []
-            for job_id, job in schedules.items():
-                run_at = datetime.fromisoformat(job['run_at'])
-                if now >= run_at and not job.get('done'):
-                    due_ids.append((job_id, job))
+            now_ts = datetime.now(timezone.utc).timestamp()
+            triggered_any = False
 
-            for job_id, job in due_ids:
-                print(f"⏰ Running scheduled job: {job_id}")
-                schedules[job_id]['done'] = True
-                save_schedules(schedules)
-                try:
-                    await client.send_message(
-                        job['chat_id'],
-                        f"⏰ **Scheduled Live Started!**\n\n🎬 {job['title']}\n📥 Quality: {job['quality']}"
-                    )
-                    await process_download(
-                        client, job['chat_id'], job['url'], job['quality'],
-                        title_hint=job['title']
-                    )
-                except Exception as e:
-                    print(f"Schedule job error: {e}")
+            for job_id, job in list(schedules.items()):
+                if not job.get("done") and now_ts >= job["start_timestamp"]:
+                    job["done"] = True
+                    save_schedules(schedules)
+                    triggered_any = True
+                    print(f"⏰ [Scheduler] Triggering scheduled download for: {job['title']}")
+
                     try:
-                        await client.send_message(job['chat_id'], f"❌ Scheduled job failed: {e}")
-                    except: pass
+                        start_msg = await client.send_message(
+                            job["chat_id"],
+                            f"🔔 **Scheduled Live Stream Started!**\n\n🎬 `{job['title']}`\n⚡ Starting download automatically..."
+                        )
+                        last_update_time[start_msg.id] = time.time()
+                        asyncio.create_task(
+                            execute_task(
+                                client=client,
+                                chat_id=job["chat_id"],
+                                url=job["url"],
+                                quality=job.get("quality", "best"),
+                                session_info=job,
+                                target_msg=start_msg
+                            )
+                        )
+                    except Exception as err:
+                        print(f"Scheduler execution error: {err}")
 
-            # Cleanup done jobs older than 1 day
-            schedules = load_schedules()
-            to_del = [k for k, v in schedules.items()
-                      if v.get('done') and (now - datetime.fromisoformat(v['run_at'])).total_seconds() > 86400]
-            for k in to_del:
-                del schedules[k]
-            if to_del:
+            if triggered_any:
                 save_schedules(schedules)
         except Exception as e:
             print(f"Scheduler loop error: {e}")
+
         await asyncio.sleep(30)
 
 # ============================================================
-# HANDLERS
+# COMMANDS & HANDLERS
 # ============================================================
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
@@ -350,45 +425,131 @@ async def start_cmd(client, message):
 
 Status : ONLINE ✅
 
-🎬 YouTube Video Download
-📅 Schedule Future Live Download
-🚀 Ultra Fast System
+🎬 YouTube Videos Supported
+📡 Live Stream Capture Enabled
+📅 Auto-Schedule Upcoming Live Streams
+✂️ 2GB+ Auto-Split Support Active
+🚀 Ultra Fast Download System
 
-Commands:
-/live <link> YYYY-MM-DD HH:MM  → schedule
-/live <link> HH:MM             → aaj/kal ka time
-/mylive                        → list scheduled
-/cancel_live <id>              → cancel
-/uploaddd                      → re-upload old files
-
-Developed By : VIVID
+Developed & Maintained By : VIVID
+System Ready For Commands...
 ```"""
     await message.reply_text(text)
 
+@app.on_message(filters.command("mylive"))
+async def mylive_cmd(client, message):
+    schedules = load_schedules()
+    active = [v for v in schedules.values() if v.get("chat_id") == message.chat.id and not v.get("done")]
+    if not active:
+        await message.reply_text("📭 Koi scheduled stream queued nahi hai.")
+        return
+
+    res = "📅 **Aapki Scheduled Streams:**\n\n"
+    for item in active:
+        start_dt = datetime.fromtimestamp(item["start_timestamp"], IST)
+        res += f"🎬 **{item['title']}**\n⏰ Start Time: `{start_dt.strftime('%d %b %Y, %I:%M %p IST')}`\n🔗 `{item['url']}`\n\n"
+    await message.reply_text(res)
+
+@app.on_message(filters.command("uploaddd"))
+async def bulk_upload(client, message):
+    files = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith((".mkv", ".mp4"))]
+    if not files:
+        await message.reply_text("No downloaded files found in the vault.")
+        return
+    await message.reply_text(f"Found {len(files)} files. Starting Re-Upload Engine...")
+    for file_name in files:
+        file_path = os.path.join(DOWNLOAD_DIR, file_name)
+        info = get_from_db(file_name)
+        tmp = await message.reply_text(f"📡 `Preparing Payload: {file_name}`")
+        start_time = time.time()
+        last_update_time[tmp.id] = start_time
+        thumb_path = await download_thumbnail(info.get("thumb"))
+        try:
+            await client.send_video(
+                chat_id=message.chat.id,
+                video=file_path,
+                caption=f"✅ `{file_name}` (Re-Uploaded)",
+                thumb=thumb_path,
+                duration=int(info.get("duration", 0)),
+                progress=upload_progress,
+                progress_args=(tmp, start_time, "")
+            )
+            await tmp.delete()
+            await asyncio.sleep(2)
+        except Exception as e:
+            await tmp.edit_text(f"❌ Failed to upload {file_name}: {str(e)}")
+        finally:
+            if thumb_path and os.path.exists(thumb_path):
+                os.remove(thumb_path)
+
+# --- LINK HANDLER ---
 @app.on_message(filters.regex(r"https?://(www\.)?youtube\.com|youtu\.be"))
 async def link_handler(client, message):
     url = message.text.strip()
     try: await message.delete()
-    except: pass
+    except Exception: pass
+
     tmp = await message.reply_text("Initializing...")
     ydl_opts = {'quiet': True, 'no_warnings': True}
+
     try:
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, lambda: YoutubeDL(ydl_opts).extract_info(url, download=False))
         session_id = str(uuid.uuid4())[:8]
+
         thumb_url = info.get('thumbnail')
         if not thumb_url and info.get('thumbnails'):
-            ts = sorted(info['thumbnails'], key=lambda x: x.get('width', 0) * x.get('height', 0), reverse=True)
-            if ts: thumb_url = ts[0].get('url')
+            thumbnails = sorted(info['thumbnails'], key=lambda x: x.get('width', 0) * x.get('height', 0), reverse=True)
+            if thumbnails:
+                thumb_url = thumbnails[0].get('url')
         if not thumb_url:
             thumb_url = "https://img.youtube.com/vi/" + info.get('id', '') + "/maxresdefault.jpg"
+
+        title = info.get('title', 'video')
+        uploader = info.get('uploader') or info.get('channel') or "Unknown"
+        duration = info.get('duration', 0)
+        release_timestamp = info.get('release_timestamp')
+
+        is_upcoming = info.get('live_status') == 'is_upcoming' or (release_timestamp and release_timestamp > time.time())
+
+        if is_upcoming and release_timestamp:
+            start_dt = datetime.fromtimestamp(release_timestamp, IST)
+            schedules = load_schedules()
+            schedules[session_id] = {
+                "chat_id": message.chat.id,
+                "url": url,
+                "title": title,
+                "uploader": uploader,
+                "thumb": thumb_url,
+                "duration": duration,
+                "quality": "best",
+                "start_timestamp": release_timestamp,
+                "done": False
+            }
+            save_schedules(schedules)
+
+            msg_text = (
+                "╔══════════════════════════════════╗\n"
+                "  ⏰ UPCOMING LIVE DETECTED\n"
+                "╚══════════════════════════════════╝\n\n"
+                f"🎬 **Title:** `{title}`\n"
+                f"👤 **Channel:** `{uploader}`\n"
+                f"📅 **Start Time:** `{start_dt.strftime('%d %b %Y, %I:%M %p IST')}`\n\n"
+                "✅ **Auto-Schedule Added!**\n"
+                "Aapko kuch karne ki zarurat nahi hai. Jaise hi ye stream live aayegi, bot turant apne aap isko record/download karke upload kar dega!\n\n"
+                "📌 View list anytime with `/mylive`"
+            )
+            await tmp.edit_text(msg_text)
+            return
+
         url_vault[session_id] = {
             "url": url,
-            "title": info.get('title', 'video'),
-            "uploader": info.get('uploader') or info.get('channel') or "Unknown",
+            "title": title,
+            "uploader": uploader,
             "thumb": thumb_url,
-            "duration": info.get('duration', 0)
+            "duration": duration
         }
+
         buttons = [
             [InlineKeyboardButton("480p", callback_data=f"q|480|{session_id}"),
              InlineKeyboardButton("720p", callback_data=f"q|720|{session_id}")],
@@ -396,118 +557,13 @@ async def link_handler(client, message):
              InlineKeyboardButton("Best Quality", callback_data=f"q|best|{session_id}")]
         ]
         await tmp.edit_text(
-            f"🎬 **Title:** `{info.get('title')}`\n\nSelect desired quality:",
+            f"🎬 **Title:** `{title}`\n\nSelect desired quality:",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     except Exception as e:
         await tmp.edit_text(f"❌ ERROR: {str(e)}")
 
-@app.on_message(filters.command("live"))
-async def schedule_live(client, message):
-    """Usage:
-       /live <url> YYYY-MM-DD HH:MM
-       /live <url> HH:MM   (aaj ya kal)
-    """
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.reply_text(
-            "📝 **Usage:**\n\n"
-            "`/live <youtube_link> YYYY-MM-DD HH:MM`\n"
-            "Example: `/live https://youtu.be/xxxx 2026-03-15 09:00`\n\n"
-            "**Shortcut (aaj/kal):**\n"
-            "`/live <link> 9:00` → aaj 9 baje (guzar gaya toh kal)\n"
-            "`/live <link> 21:30` → aaj 9:30 PM\n"
-        )
-        return
-
-    parts = args[1].strip().split()
-    if len(parts) < 2:
-        await message.reply_text("❌ Link ya time missing. `/live` for help.")
-        return
-
-    url = parts[0]
-    if not re.match(r"https?://", url):
-        await message.reply_text("❌ Invalid URL.")
-        return
-
-    time_str = " ".join(parts[1:])
-    run_at = None
-    try:
-        if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}$", time_str):
-            run_at = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
-        elif re.match(r"^\d{1,2}:\d{2}$", time_str):
-            h, m = map(int, time_str.split(":"))
-            now = now_local()
-            candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if candidate <= now:
-                candidate += timedelta(days=1)
-            run_at = candidate
-        else:
-            raise ValueError("Bad format")
-    except Exception:
-        await message.reply_text("❌ Time format galat. `YYYY-MM-DD HH:MM` ya `HH:MM` use karo.")
-        return
-
-    try:
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, lambda: YoutubeDL({'quiet': True}).extract_info(url, download=False))
-        title = info.get('title', 'Live Stream')
-    except Exception as e:
-        await message.reply_text(f"⚠️ Info fetch failed: {e}\nSaving as 'Live Stream'")
-        title = "Live Stream"
-
-    job_id = str(uuid.uuid4())[:8]
-    schedules = load_schedules()
-    schedules[job_id] = {
-        "chat_id": message.chat.id,
-        "url": url,
-        "quality": "best",
-        "run_at": run_at.isoformat(),
-        "title": title,
-        "done": False
-    }
-    save_schedules(schedules)
-
-    await message.reply_text(
-        f"✅ **Live Scheduled!**\n\n"
-        f"🆔 ID: `{job_id}`\n"
-        f"🎬 {title}\n"
-        f"📅 Start: `{run_at.strftime('%Y-%m-%d %H:%M')}`\n"
-        f"📥 Quality: Best\n\n"
-        f"Bot exact time pe auto-download karega. `/mylive` se list dekho."
-    )
-
-@app.on_message(filters.command("mylive"))
-async def my_live(client, message):
-    schedules = load_schedules()
-    mine = {k: v for k, v in schedules.items() if v['chat_id'] == message.chat.id and not v.get('done')}
-    if not mine:
-        await message.reply_text("📭 Koi scheduled live nahi hai.")
-        return
-    lines = ["📅 **Your Scheduled Lives:**\n"]
-    for jid, j in mine.items():
-        dt = datetime.fromisoformat(j['run_at'])
-        lines.append(f"`{jid}` → {j['title'][:40]}\n   ⏰ {dt.strftime('%Y-%m-%d %H:%M')}\n")
-    await message.reply_text("\n".join(lines))
-
-@app.on_message(filters.command("cancel_live"))
-async def cancel_live(client, message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.reply_text("Usage: `/cancel_live <job_id>`")
-        return
-    jid = args[1]
-    schedules = load_schedules()
-    if jid not in schedules:
-        await message.reply_text("❌ ID not found.")
-        return
-    if schedules[jid]['chat_id'] != message.chat.id:
-        await message.reply_text("❌ Ye tumhara schedule nahi hai.")
-        return
-    del schedules[jid]
-    save_schedules(schedules)
-    await message.reply_text(f"✅ Cancelled `{jid}`")
-
+# --- DOWNLOAD CALLBACK ---
 @app.on_callback_query(filters.regex(r"^q\|"))
 async def download_callback(client: Client, callback_query: CallbackQuery):
     _, quality, session_id = callback_query.data.split("|")
@@ -515,62 +571,44 @@ async def download_callback(client: Client, callback_query: CallbackQuery):
     if not data:
         await callback_query.answer("Session Expired!", show_alert=True)
         return
-    await callback_query.message.delete()
-    await process_download(client, callback_query.message.chat.id, data['url'], quality, title_hint=data['title'])
 
-@app.on_message(filters.command("uploaddd"))
-async def bulk_upload(client, message):
-    files = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith((".mkv", ".mp4"))]
-    if not files:
-        await message.reply_text("No files.")
-        return
-    await message.reply_text(f"Found {len(files)} files. Re-uploading...")
-    for file_name in files:
-        file_path = os.path.join(DOWNLOAD_DIR, file_name)
-        info = get_from_db(file_name)
-        tmp = await message.reply_text(f"📡 `Preparing: {file_name}`")
-        start_time = time.time()
-        last_update_time[tmp.id] = start_time
-        thumb_path = await download_thumbnail(info.get("thumb"))
-        try:
-            await client.send_video(
-                chat_id=message.chat.id, video=file_path,
-                caption=f"✅ `{file_name}`",
-                thumb=thumb_path, duration=int(info.get("duration", 0)),
-                progress=upload_progress, progress_args=(tmp, start_time)
-            )
-            await tmp.delete()
-        except Exception as e:
-            await tmp.edit_text(f"❌ {e}")
-        finally:
-            if thumb_path and os.path.exists(thumb_path):
-                os.remove(thumb_path)
+    msg = callback_query.message
+    await msg.edit_text("⚡ `Initializing Kernel...`")
+    last_update_time[msg.id] = time.time()
+
+    await execute_task(
+        client=client,
+        chat_id=msg.chat.id,
+        url=data['url'],
+        quality=quality,
+        session_info=data,
+        target_msg=msg
+    )
 
 # ============================================================
-# HEALTH SERVER (Render ke liye — sleep rok)
+# DUMMY HEALTH SERVER (Render/Railway Sleep Preventer)
 # ============================================================
 async def health_server():
     async def handle(request):
-        return web.Response(text="Vivid Bot is alive ✅")
-    http_app = web.Application()
-    http_app.router.add_get('/', handle)
-    runner = web.AppRunner(http_app)
+        return web.Response(text="Vivid Bot is Online 24/7 🚀")
+    server = web.Application()
+    server.router.add_get('/', handle)
+    runner = web.AppRunner(server)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"✅ Health server on :{port}")
+    print(f"✅ Health check server listening on port {port}")
 
 # ============================================================
-# MAIN — Bot + Scheduler + Health ek saath
+# MAIN ENTRYPOINT
 # ============================================================
 async def main():
     asyncio.create_task(health_server())
     await app.start()
     me = await app.get_me()
-    print(f"🚀 Vivid Bot online: @{me.username}")
-    asyncio.create_task(scheduler_loop(app))
-    print("⏰ Scheduler started")
+    print(f"🚀 Bot is running 24/7 as @{me.username}")
+    asyncio.create_task(scheduler_worker(app))
     await asyncio.Event().wait()
 
 if __name__ == "__main__":

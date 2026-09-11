@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+downloads/
+vivid_db.json
+schedules.json
+*.tmp
+.env
